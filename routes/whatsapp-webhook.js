@@ -39,6 +39,8 @@ router.get('/webhook', (req, res) => {
 
 /** POST - Meta webhook events (messages, status updates, etc.) */
 router.post('/webhook', async (req, res) => {
+  // Log first - if you never see this, Meta is not sending POSTs to your server
+  console.log('[WhatsApp] POST /webhook hit');
   // Acknowledge immediately - Meta expects 200 within ~20 seconds
   res.status(200).send();
 
