@@ -131,6 +131,25 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
+/** GET /api/whatsapp/test-token - verify Meta token is valid (for debugging) */
+router.get('/test-token', async (req, res) => {
+  if (!config.accessToken || !config.phoneNumberId) {
+    return res.json({ ok: false, error: 'META_WHATSAPP_ACCESS_TOKEN or META_WHATSAPP_PHONE_NUMBER_ID not set' });
+  }
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/v21.0/${config.phoneNumberId}?fields=verified_name&access_token=${config.accessToken}`
+    );
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return res.json({ ok: false, error: data.error?.message || `HTTP ${r.status}`, code: data.error?.code });
+    }
+    res.json({ ok: true, verified_name: data.verified_name });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
 /**
  * LOCAL TESTING: Simulate incoming WhatsApp message without Meta/ngrok
  * POST /api/whatsapp/simulate
