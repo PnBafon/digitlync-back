@@ -1,12 +1,13 @@
-# DigiLync WhatsApp Bot Setup
+# DigiLync WhatsApp Bot Setup (Meta Cloud API)
 
 ## Overview
 
-The WhatsApp bot enables **farmer and provider registration** directly via WhatsApp, per the DigiLync SRS Phase 1.
+The WhatsApp bot enables **farmer and provider registration** directly via WhatsApp, per the DigiLync SRS Phase 1. It uses **Meta's WhatsApp Cloud API**.
 
 ## Prerequisites
 
-- Twilio account with WhatsApp Sandbox or WhatsApp Business API
+- Meta for Developers account
+- WhatsApp Business Account (created when you add WhatsApp to your Meta app)
 - Node.js backend running with PostgreSQL
 
 ## Configuration
@@ -14,9 +15,9 @@ The WhatsApp bot enables **farmer and provider registration** directly via Whats
 1. Add to your `.env`:
 
 ```
-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TWILIO_AUTH_TOKEN=your_auth_token
-TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+META_WHATSAPP_ACCESS_TOKEN=your_page_access_token
+META_WHATSAPP_PHONE_NUMBER_ID=your_phone_number_id
+META_WHATSAPP_VERIFY_TOKEN=digilync-webhook-verify
 ```
 
 2. Run the migration:
@@ -31,16 +32,19 @@ npm run migrate:whatsapp
 npm install
 ```
 
-## Twilio Webhook Setup
+## Meta Webhook Setup
 
-1. In [Twilio Console](https://console.twilio.com) → Messaging → Try it out → Send a WhatsApp message
-2. Configure the sandbox "When a message comes in" webhook URL:
-   - **URL**: `https://your-api-domain.com/api/whatsapp/webhook`
-   - **Method**: POST
+1. Go to [Meta for Developers](https://developers.facebook.com) → Your App → **WhatsApp** → **Configuration**
+2. Under **Webhook**, click **Edit**
+3. **Callback URL**: `https://digitlync-back.onrender.com/api/whatsapp/webhook`
+4. **Verify Token**: `digilync-webhook-verify` (must match `META_WHATSAPP_VERIFY_TOKEN` in your `.env`)
+5. **Fallback URL**: Same as Callback URL
+6. Subscribe to **messages** webhook field
+7. Click **Verify and Save**
 
-### Local testing without Twilio/ngrok (simulator)
+### Local testing without Meta/ngrok (simulator)
 
-You can test the full conversation flow locally **without** Twilio or ngrok:
+You can test the full conversation flow locally **without** Meta or ngrok:
 
 ```bash
 # 1. Start the backend
@@ -68,7 +72,13 @@ For local development with real WhatsApp, use [ngrok](https://ngrok.com) to expo
 ngrok http 5000
 ```
 
-Then set the webhook to: `https://xxxx.ngrok.io/api/whatsapp/webhook`
+Then set the webhook Callback URL in Meta to: `https://xxxx.ngrok.io/api/whatsapp/webhook`
+
+## Getting Meta Credentials
+
+1. **Meta for Developers** → Your App → **WhatsApp** → **API Setup**
+2. **Phone number ID**: Shown under "From" (e.g. `123456789012345`)
+3. **Access Token**: Click "Generate" to create a temporary token, or use a System User for a permanent token
 
 ## User Flow
 
@@ -86,76 +96,52 @@ Then set the webhook to: `https://xxxx.ngrok.io/api/whatsapp/webhook`
 
 ## Security Note
 
-**Never commit** `TWILIO_ACCOUNT_SID` or `TWILIO_AUTH_TOKEN` to source control. Use environment variables only.
+**Never commit** `META_WHATSAPP_ACCESS_TOKEN` to source control. Use environment variables only.
 
 ---
 
 ## Troubleshooting: "No reply when I send a message"
 
-### 1. Check webhook is configured in Twilio
+### 1. Check webhook is configured in Meta
 
-1. Go to [Twilio Console](https://console.twilio.com) → **Messaging** → **Try it out** → **Send a WhatsApp message** (or [WhatsApp Sandbox](https://console.twilio.com/us1/develop/sms/try-it-out/whatsapp-learn))
-2. Under **Sandbox configuration**, find **"When a message comes in"**
-3. Set URL to: `https://digitlync-back.onrender.com/api/whatsapp/webhook` (use the URL where Twilio env vars are set)
-4. Method: **POST**
-5. Save
-
-**Important:** The webhook must point to the server that has `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_WHATSAPP_FROM` set. If your backend runs on Render, use `digitlync-back.onrender.com`; if `api.digilync.net` has those env vars, use that instead.
+1. Go to [Meta for Developers](https://developers.facebook.com) → Your App → **WhatsApp** → **Configuration**
+2. Webhook Callback URL: `https://digitlync-back.onrender.com/api/whatsapp/webhook`
+3. Verify Token must match `META_WHATSAPP_VERIFY_TOKEN` in your `.env`
+4. Ensure **messages** is subscribed
 
 ### 2. Verify your API receives the webhook
 
 Visit: `https://digitlync-back.onrender.com/api/whatsapp/webhook` (GET)
 
-- If you see `"whatsapp": "configured"` → Twilio credentials are set on that server
-- If you see `"whatsapp": "not_configured"` → Add `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` to that deployment's environment variables
+- If you see `"whatsapp": "configured"` → Meta credentials are set on that server
+- If you see `"whatsapp": "not_configured"` → Add `META_WHATSAPP_ACCESS_TOKEN` and `META_WHATSAPP_PHONE_NUMBER_ID` to your deployment
 
-### 3. Twilio WhatsApp Sandbox – join first
+### 3. Meta WhatsApp – messaging window
 
-For the **sandbox**, users must join before messaging:
-
-1. In Twilio Console → Messaging → WhatsApp Sandbox
-2. You'll see: "Send 'join &lt;your-code&gt;' to +1 415 523 8886"
-3. **You must send that exact message** from your WhatsApp to the sandbox number first
-4. Only after joining will the bot reply
+For **test numbers**, add them in Meta for Developers → WhatsApp → **API Setup** → "To" field. Only added numbers can message your business during development.
 
 ### 4. Environment variables in production
 
-Ensure these are set where your backend runs (e.g. hosting platform env vars):
+Ensure these are set where your backend runs:
 
 ```
-TWILIO_ACCOUNT_SID=ACxxxxxxxx...
-TWILIO_AUTH_TOKEN=your_auth_token
-TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+META_WHATSAPP_ACCESS_TOKEN=your_token
+META_WHATSAPP_PHONE_NUMBER_ID=your_phone_number_id
+META_WHATSAPP_VERIFY_TOKEN=digilync-webhook-verify
 ```
-
-For sandbox, `TWILIO_WHATSAPP_FROM` is usually `whatsapp:+14155238886`. For WhatsApp Business API, use your approved number.
 
 ### 5. Check backend logs
 
 After sending a message, check your server logs. You should see:
 
-- `[WhatsApp] POST /webhook received` → Request reached your server (first thing to look for)
-- `[WhatsApp] Incoming: { from: '***4383', bodyLen: 2 }` → Message parsed correctly
+- `[WhatsApp] POST /webhook received` → Request reached your server
 - `[WhatsApp] Reply sent to ***4383` → Reply was sent
 
-**If you see nothing** → Twilio is not reaching your webhook. Check:
-- Webhook URL in Twilio Console (exact path: `/api/whatsapp/webhook`, method: POST)
+**If you see nothing** → Meta is not reaching your webhook. Check:
+- Webhook URL in Meta (exact path: `/api/whatsapp/webhook`)
 - Your API is publicly reachable (use ngrok for local dev)
-- No firewall/SSL issues blocking Twilio
+- Verify token matches
 
 **If you see "POST /webhook received" but no reply** → Check for:
-- `Missing From and WaId` → Twilio sent unexpected payload; check `bodyKeys` in logs
-- `Twilio not configured` → Set env vars in your deployment
-- `Webhook error` → Check the error stack trace; often DB connection or Twilio API issue
-
-### 6. Test webhook manually (curl)
-
-To verify your server receives POSTs correctly:
-
-```bash
-curl -X POST "https://api.digilync.net/api/whatsapp/webhook" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "From=whatsapp:+237675644383&Body=hi"
-```
-
-You should see `[WhatsApp] POST /webhook received` in logs. If the bot is configured, it will try to reply (may fail for non-sandbox numbers).
+- `Meta not configured` → Set env vars in your deployment
+- `Webhook error` → Check the error stack trace

@@ -1,88 +1,125 @@
 /**
- * Twilio WhatsApp webhook - receives incoming messages
- * Configure in Twilio Console → Messaging → WhatsApp Sandbox → Sandbox configuration
- * Webhook URL: https://digitlync-back.onrender.com/api/whatsapp/webhook (or https://api.digilync.net if env vars are set there)
- * Method: POST
+ * Meta WhatsApp Cloud API webhook - receives incoming messages
+ * Configure in Meta for Developers → WhatsApp → Configuration
+ * Webhook URL: https://digitlync-back.onrender.com/api/whatsapp/webhook
+ * Verify Token: Set in META_WHATSAPP_VERIFY_TOKEN - must match Meta's form
  */
 const express = require('express');
 const router = express.Router();
 const { handleIncoming } = require('../services/whatsapp-conversation');
 const { sendText, isEnabled } = require('../services/whatsapp-sender');
+const config = require('../config/whatsapp');
 
-/** GET - Status check (for debugging, no auth) */
+/** GET - Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) */
 router.get('/webhook', (req, res) => {
-  res.json({
-    status: 'ok',
-    whatsapp: isEnabled() ? 'configured' : 'not_configured',
-    hint: 'Twilio must POST to this URL. Set webhook in Twilio Console → Messaging → WhatsApp Sandbox.',
-  });
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  // Meta sends hub.mode=subscribe, hub.verify_token, hub.challenge
+  if (mode === 'subscribe' && token === config.verifyToken) {
+    const challengeStr = challenge != null ? String(challenge) : '';
+    console.log('[WhatsApp] Meta webhook verified');
+    return res.type('text/plain').status(200).send(challengeStr);
+  }
+
+  // Status check when not a Meta verification request
+  if (!mode && !token) {
+    return res.json({
+      status: 'ok',
+      whatsapp: isEnabled() ? 'configured' : 'not_configured',
+      hint: 'Meta webhook. Set callback URL in Meta for Developers → WhatsApp → Configuration.',
+    });
+  }
+
+  // Log failed verification for debugging
+  console.warn('[WhatsApp] Verification failed', { mode, tokenMatch: token === config.verifyToken, hasChallenge: !!challenge });
+  res.status(403).send('Forbidden');
 });
 
-// Twilio sends application/x-www-form-urlencoded
+/** POST - Meta webhook events (messages, status updates, etc.) */
 router.post('/webhook', async (req, res) => {
-  // Log immediately - if you never see this, Twilio is not reaching your server
-  const bodyKeys = req.body ? Object.keys(req.body) : [];
-  console.log('[WhatsApp] POST /webhook received', {
-    bodyKeys: bodyKeys.slice(0, 15),
-    hasFrom: !!req.body?.From,
-    hasWaId: !!req.body?.WaId,
-    hasBody: !!req.body?.Body,
-  });
-
-  // Twilio WhatsApp can send From (e.g. whatsapp:+1234567890) or WaId (phone without prefix)
-  let from = req.body?.From;
-  if (!from && req.body?.WaId) {
-    from = req.body.WaId.startsWith('whatsapp:') ? req.body.WaId : `whatsapp:+${req.body.WaId}`;
-    console.log('[WhatsApp] Using WaId as From fallback');
-  }
-
-  // Twilio may send Body empty for media; treat as empty string
-  const body = String(req.body?.Body ?? req.body?.body ?? '').trim();
-  console.log('[WhatsApp] Incoming:', { from: from ? '***' + from.slice(-4) : 'missing', bodyLen: body.length });
-
-  if (!isEnabled()) {
-    console.warn('[WhatsApp] Twilio not configured - set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM');
-    return res.status(503).send('WhatsApp not configured');
-  }
-
-  const latitude = req.body?.Latitude;
-  const longitude = req.body?.Longitude;
-  const profileName = req.body?.ProfileName || '';
-
-  if (!from) {
-    console.error('[WhatsApp] Missing From and WaId - raw body keys:', bodyKeys);
-    return res.status(400).send('Missing From');
-  }
-
-  try {
-    const reply = await handleIncoming(from, body, latitude, longitude, profileName);
-    if (reply) {
-      await sendText(from, reply);
-      console.log('[WhatsApp] Reply sent to', from ? '***' + from.slice(-4) : '?');
-    } else {
-      console.log('[WhatsApp] No reply to send (handleIncoming returned null)');
-    }
-    // Twilio expects TwiML or 200; empty <Response/> acknowledges receipt (we reply via REST API)
-    res.type('text/xml').send('<Response></Response>');
-  } catch (err) {
-    console.error('[WhatsApp] Webhook error:', err);
-    console.error('[WhatsApp] Stack:', err.stack);
-    try {
-      await sendText(from, 'Sorry, something went wrong. Please try again later.');
-    } catch (e) {
-      console.error('Failed to send error reply:', e);
-    }
-    res.type('text/xml').status(500).send('<Response></Response>');
-  }
-});
-
-/** Status callback (optional) - for delivery reports */
-router.post('/status', (req, res) => {
+  // Acknowledge immediately - Meta expects 200 within ~20 seconds
   res.status(200).send();
+
+  const body = req.body;
+  if (!body || body.object !== 'whatsapp_business_account') {
+    return;
+  }
+
+  const entries = body.entry || [];
+  for (const entry of entries) {
+    const changes = entry.changes || [];
+    for (const change of changes) {
+      if (change.field !== 'messages') continue;
+
+      const value = change.value || {};
+      const messages = value.messages || [];
+      const contacts = value.contacts || [];
+      const contactMap = {};
+      for (const c of contacts) {
+        if (c.wa_id) contactMap[c.wa_id] = c.profile?.name || '';
+      }
+
+      for (const msg of messages) {
+        const from = msg.from || msg.wa_id;
+        if (!from) continue;
+
+        const waFrom = `whatsapp:+${String(from).replace(/^\+/, '')}`;
+        const profileName = contactMap[from] || '';
+
+        let text = '';
+        let latitude = null;
+        let longitude = null;
+
+        if (msg.type === 'text') {
+          text = msg.text?.body || '';
+        } else if (msg.type === 'location') {
+          latitude = msg.location?.latitude;
+          longitude = msg.location?.longitude;
+          text = msg.location?.name || '';
+        } else if (msg.type === 'interactive') {
+          const btn = msg.interactive?.button_reply;
+          const list = msg.interactive?.list_reply;
+          text = (btn?.title || list?.title || list?.description || '').trim();
+        } else {
+          console.log('[WhatsApp] Unsupported message type:', msg.type);
+          continue;
+        }
+
+        console.log('[WhatsApp] POST /webhook received', {
+          from: '***' + String(from).slice(-4),
+          bodyLen: text.length,
+          type: msg.type,
+        });
+
+        if (!isEnabled()) {
+          console.warn('[WhatsApp] Meta not configured - set META_WHATSAPP_ACCESS_TOKEN, META_WHATSAPP_PHONE_NUMBER_ID');
+          continue;
+        }
+
+        try {
+          const reply = await handleIncoming(waFrom, text, latitude, longitude, profileName);
+          if (reply) {
+            await sendText(waFrom, reply);
+            console.log('[WhatsApp] Reply sent to', '***' + String(from).slice(-4));
+          }
+        } catch (err) {
+          console.error('[WhatsApp] Webhook error:', err);
+          console.error('[WhatsApp] Stack:', err.stack);
+          try {
+            await sendText(waFrom, 'Sorry, something went wrong. Please try again later.');
+          } catch (e) {
+            console.error('Failed to send error reply:', e);
+          }
+        }
+      }
+    }
+  }
 });
 
 /**
- * LOCAL TESTING: Simulate incoming WhatsApp message without Twilio/ngrok
+ * LOCAL TESTING: Simulate incoming WhatsApp message without Meta/ngrok
  * POST /api/whatsapp/simulate
  * Body (JSON): { from: "whatsapp:+237675644383", body: "hi", latitude?, longitude?, profileName? }
  * Returns: { reply: "..." } - the bot's response (no real WhatsApp message sent)

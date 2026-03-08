@@ -6,7 +6,7 @@ echo.
 echo Make sure your backend is running first: npm run dev
 echo.
 echo Starting ngrok on port 5000...
-echo (Your public URL will appear below. Use it in Twilio webhook.)
+echo (Your public URL will appear below. Use it in Meta webhook configuration.)
 echo.
 ngrok http 5000
 if errorlevel 1 (

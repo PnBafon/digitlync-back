@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Test WhatsApp bot locally via simulator (no Twilio/ngrok needed)
+ * Test WhatsApp bot locally via simulator (no Meta/ngrok needed)
  * Run: node scripts/test-whatsapp-simulator.js
  * Prerequisites: Backend running (npm run dev), DB + whatsapp_sessions migrated
  */
