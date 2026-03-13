@@ -1,7 +1,8 @@
 /**
  * Meta WhatsApp Cloud API webhook - receives incoming messages
+ * Deploy: set META_WHATSAPP_* in platform env vars (do not commit .env)
  * Configure in Meta for Developers → WhatsApp → Configuration
- * Webhook URL: https://digitlync-back.onrender.com/api/whatsapp/webhook
+ * Webhook URL: https://api.digilync.net/api/whatsapp/webhook
  * Verify Token: Set in META_WHATSAPP_VERIFY_TOKEN - must match Meta's form
  */
 const express = require('express');
@@ -104,7 +105,7 @@ router.post('/webhook', async (req, res) => {
         });
 
         if (!isEnabled()) {
-          console.warn('[WhatsApp] Meta not configured - set META_WHATSAPP_ACCESS_TOKEN, META_WHATSAPP_PHONE_NUMBER_ID in Render Environment');
+          console.warn('[WhatsApp] Meta not configured - set META_WHATSAPP_ACCESS_TOKEN, META_WHATSAPP_PHONE_NUMBER_ID in environment');
           continue;
         }
 
