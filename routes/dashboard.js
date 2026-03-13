@@ -19,11 +19,17 @@ router.get('/stats', async (req, res) => {
       bookingsCount = r.rows[0]?.count ?? 0;
     } catch (_) {}
 
+    let pendingRequests = 0;
+    try {
+      const r = await pool.query("SELECT COUNT(*)::int AS count FROM bookings WHERE provider_id IS NULL AND status = 'pending'");
+      pendingRequests = r.rows[0]?.count ?? 0;
+    } catch (_) {}
+
     res.json({
       farmers: farmersCount,
       providers: providersCount,
       bookings: bookingsCount,
-      pendingRequests: 0,
+      pendingRequests,
     });
   } catch (err) {
     console.error('Dashboard stats error:', err);

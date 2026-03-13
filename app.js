@@ -3,10 +3,10 @@ const cors = require('cors');
 
 const app = express();
 
-// CORS: allow frontend (localhost:3000 in dev, digilync.net + www in prod)
+// CORS: allow frontend (localhost:3000 in dev, digilync.net + Render in prod)
 const defaultOrigins =
   process.env.NODE_ENV === 'production'
-    ? ['https://digilync.net', 'https://www.digilync.net']
+    ? ['https://digilync.net', 'https://www.digilync.net', 'https://digitlync-front.onrender.com']
     : ['http://localhost:3000'];
 const allowedOrigins = (process.env.FRONTEND_URL || defaultOrigins.join(','))
   .split(',')
@@ -66,6 +66,9 @@ app.use('/api/farmers', require('./routes/farmers'));
 app.use('/api/providers', require('./routes/providers'));
 app.use('/api/bookings', require('./routes/bookings'));
 app.use('/api/admin-ratings', require('./routes/admin-ratings'));
+app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/ratings', require('./routes/ratings'));
+app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/audit-logs', require('./routes/audit-logs'));
 app.use('/api/public', require('./routes/public-metrics'));
 app.use('/api/farm-plots', require('./routes/farm-plots'));
