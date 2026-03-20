@@ -217,6 +217,41 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
     return getMainMenu(existing);
   }
 
+  // In-flow handlers (must run BEFORE main menu option checks, so "1" in unsubscribe_confirm is not mistaken for "Register as Farmer")
+  if (session.step === 'unsubscribe_confirm' && existing) {
+    return handleUnsubscribeConfirm(waFrom, existing, text);
+  }
+  if (session.step === 'recap_options' && existing) {
+    if (text === '1') {
+      const farms = (data.farms && data.farms.length) ? data.farms : await getFarmerFarms(existing.id);
+      if (farms.length > 1) {
+        await updateSession(waFrom, { step: 'request_select_farm', data: { farmer_id: existing.id, farms } });
+        return getRequestSelectFarmMessage(farms);
+      }
+      const farm = farms[0];
+      await updateSession(waFrom, {
+        step: 'request_input',
+        data: {
+          farmer_id: existing.id,
+          farm_plot_id: farm?.id,
+          farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha,
+          farm_gps_lat: farm?.gps_lat,
+          farm_gps_lng: farm?.gps_lng,
+        },
+      });
+      return getRequestInputMessage({ farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha });
+    }
+    if (text === '2') {
+      await updateSession(waFrom, { step: 'main_menu', data: {} });
+      return 'To edit farm details, please contact the admin team or use the DigiLync web portal.\n\nReply *MENU* for options.';
+    }
+    if (text === '3') {
+      return handleAddAnotherFarm(waFrom, existing);
+    }
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    return getMainMenu(existing);
+  }
+
   // Registered user: handle menu options
   if (existing) {
     if (text === '4') return handleMyRequests(waFrom, existing);
@@ -281,35 +316,8 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
   }
 
   // In-flow handlers
-  if (session.step === 'unsubscribe_confirm' && existing) {
-    return handleUnsubscribeConfirm(waFrom, existing, text);
-  }
-  if (session.step === 'recap_options' && existing) {
-    if (text === '1') {
-      const farms = (data.farms && data.farms.length) ? data.farms : await getFarmerFarms(existing.id);
-      if (farms.length > 1) {
-        await updateSession(waFrom, { step: 'request_select_farm', data: { farmer_id: existing.id, farms } });
-        return getRequestSelectFarmMessage(farms);
-      }
-      const farm = farms[0];
-      await updateSession(waFrom, {
-        step: 'request_input',
-        data: {
-          farmer_id: existing.id,
-          farm_plot_id: farm?.id,
-          farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha,
-          farm_gps_lat: farm?.gps_lat,
-          farm_gps_lng: farm?.gps_lng,
-        },
-      });
-      return getRequestInputMessage({ farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha });
-    }
-    if (text === '2') {
-      await updateSession(waFrom, { step: 'main_menu', data: {} });
-      return 'To edit farm details, please contact the admin team or use the DigiLync web portal.\n\nReply *MENU* for options.';
-    }
-    await updateSession(waFrom, { step: 'main_menu', data: {} });
-    return getMainMenu(existing);
+  if (session.step === 'add_farm_details' && existing?.type === 'farmer') {
+    return handleAddFarmDetails(waFrom, existing, text, data);
   }
   if (session.step && session.step.startsWith('farmer_')) {
     return handleFarmerFlow(waFrom, session, data, text, latitude, longitude);
@@ -953,7 +961,7 @@ async function handleRecap(waFrom, existing, setStep = false) {
       msg += `Crop: ${crop}\n`;
       msg += `Size: ${size} ha\n\n`;
     });
-    msg += 'Options:\n1. Request service for a farm\n2. Edit farm details\n\nReply *MENU* to go back.';
+    msg += 'Options:\n1. Request service for a farm\n2. Edit farm details\n3. Add another farm\n\nReply *MENU* to go back.';
     if (setStep) {
       await updateSession(waFrom, { step: 'recap_options', data: { farmer_id: existing.id, farms } });
     }
@@ -975,6 +983,48 @@ async function handleRecap(waFrom, existing, setStep = false) {
     return msg;
   }
   return getMainMenu();
+}
+
+function getAddFarmDetailsMessage() {
+  return (
+    'Add another farm:\n\n' +
+    'Enter in this format:\n\n' +
+    'Farm size (hectares):\n' +
+    'Crop(s):\n\n' +
+    '*Example:*\n' +
+    'Farm size: 2.5\n' +
+    'Crop: Maize, Cassava'
+  );
+}
+
+async function handleAddAnotherFarm(waFrom, existing) {
+  await updateSession(waFrom, { step: 'add_farm_details', data: { farmer_id: existing.id } });
+  return getAddFarmDetailsMessage();
+}
+
+async function handleAddFarmDetails(waFrom, existing, text, data) {
+  const kv = parseKeyValueBlock(text);
+  const farmSize = parseFloat(kv.farm_size || kv.farm_size_hectares || '');
+  const crop = kv.crop || kv.crops || '';
+  if (isNaN(farmSize) || farmSize < 0) return 'Please include *Farm size:* (number). Example: Farm size: 2.5\n\n' + getAddFarmDetailsMessage();
+  try {
+    const farmerRes = await pool.query('SELECT gps_lat, gps_lng FROM farmers WHERE id = $1', [existing.id]);
+    const f = farmerRes.rows[0];
+    const gpsLat = f?.gps_lat != null ? parseFloat(f.gps_lat) : 0;
+    const gpsLng = f?.gps_lng != null ? parseFloat(f.gps_lng) : 0;
+    const plotsRes = await pool.query('SELECT id FROM farm_plots WHERE farmer_id = $1 ORDER BY id', [existing.id]);
+    const plotName = `Farm ${plotsRes.rows.length + 1}`;
+    await pool.query(
+      `INSERT INTO farm_plots (farmer_id, gps_lat, gps_lng, plot_name, plot_size_ha, crop_type)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [existing.id, gpsLat, gpsLng, plotName, farmSize, crop || 'Not specified']
+    );
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    return `✅ *Farm added successfully!*\n\n${plotName}: ${farmSize} ha, ${crop || 'Not specified'}\n\nReply *MENU* for options.`;
+  } catch (err) {
+    console.error('Add farm error:', err);
+    return 'Sorry, we could not add the farm. Please try again.\n\n' + getAddFarmDetailsMessage();
+  }
 }
 
 async function handleUnsubscribeFlow(waFrom, existing) {
