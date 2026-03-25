@@ -161,6 +161,63 @@ function getHelpMessage() {
   );
 }
 
+/** Shown immediately after farmer/provider registration; Agree completes onboarding, Disagree removes the new record. */
+function getPrivacyConsentPostRegisterMessage() {
+  return (
+    '🔒 *Your privacy matters*\n\n' +
+    'DigiLync takes your personal information seriously. We use it only to deliver and improve our services: coordinating agricultural services, enabling access to service-based credit where applicable, and supporting secure transactions.\n\n' +
+    'We do not sell your data. We do not share it with third parties without your permission, except where necessary to provide the service or to meet legal obligations.\n\n' +
+    'By continuing, you agree to the collection and use of your data as described above and in our Privacy Policy (digilync.com/privacy).\n\n' +
+    '*Do you consent?*\n\n' +
+    '1. Agree\n' +
+    '2. Disagree'
+  );
+}
+
+async function handlePrivacyConsentPostRegister(waFrom, text, data) {
+  const pending = data.privacy_pending;
+  const phone = normalizePhone(waFrom);
+  const t = text.trim().toLowerCase();
+  if (!pending || !pending.role || !pending.id) {
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    const existing = await findExistingUser(phone);
+    return getMainMenu(existing);
+  }
+  const agreed = t === '1' || t === 'agree' || t === 'yes' || t === 'i agree';
+  const disagreed = t === '2' || t === 'disagree' || t === 'no';
+
+  if (disagreed) {
+    try {
+      if (pending.role === 'farmer') {
+        await pool.query('DELETE FROM farm_plots WHERE farmer_id = $1', [pending.id]);
+        await pool.query('DELETE FROM bookings WHERE farmer_id = $1', [pending.id]);
+        await pool.query('DELETE FROM farmers WHERE id = $1', [pending.id]);
+      } else if (pending.role === 'provider') {
+        await pool.query('UPDATE bookings SET provider_id = NULL WHERE provider_id = $1', [pending.id]);
+        await pool.query('DELETE FROM providers WHERE id = $1', [pending.id]);
+      }
+    } catch (err) {
+      console.error('Privacy consent reject cleanup error:', err);
+      return 'Sorry, something went wrong. Please contact contact@digilync.com.';
+    }
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    return (
+      'We cannot keep your account without your consent. Your registration has been removed.\n\n' +
+      'You can register again anytime if you change your mind. Reply *MENU* for options.'
+    );
+  }
+
+  if (agreed) {
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    if (pending.role === 'farmer') {
+      return '✅ *Registration complete!* You are now a DigiLync farmer.\n\nReply *MENU* for options.';
+    }
+    return '✅ *Registration complete!* You are now a DigiLync service provider.\n\nReply *MENU* for options.';
+  }
+
+  return 'Please reply *1* to Agree or *2* to Disagree.';
+}
+
 async function getFarmerFarms(farmerId) {
   const farmerRes = await pool.query(
     'SELECT village FROM farmers WHERE id = $1',
@@ -210,6 +267,10 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
   const existing = await findExistingUser(phone);
   const session = await getSession(waFrom);
   const data = typeof session.data === 'object' ? session.data : (session.data ? JSON.parse(session.data) : {});
+
+  if (session.step === 'privacy_consent_new') {
+    return handlePrivacyConsentPostRegister(waFrom, text, data);
+  }
 
   // Main menu triggers
   if (['hi', 'hello', 'menu', 'start', '0', '5'].includes(textLower)) {
@@ -627,8 +688,12 @@ async function handleFarmerFlow(waFrom, session, data, text, latitude, longitude
               ]
             );
           }
-          await updateSession(waFrom, { step: 'main_menu', user_type: 'unknown', data: {} });
-          return '✅ *Registration complete!* You are now a DigiLync farmer.\n\nReply *MENU* for options.';
+          await updateSession(waFrom, {
+            step: 'privacy_consent_new',
+            user_type: 'unknown',
+            data: { privacy_pending: { role: 'farmer', id: farmerId } },
+          });
+          return getPrivacyConsentPostRegisterMessage();
         } catch (err) {
           console.error('Farmer registration error:', err);
           return 'Sorry, registration failed. Please try again.';
@@ -727,13 +792,18 @@ async function handleProviderFlow(waFrom, session, data, text, latitude, longitu
     }
     const haPerHour = isNaN(capacity) ? null : capacity / 8;
     try {
-      await pool.query(
+      const ins = await pool.query(
         `INSERT INTO providers (full_name, phone, services_offered, work_capacity_ha_per_hour, base_price_per_ha, service_radius_km, gps_lat, gps_lng)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
         [name, phone, (services.length ? services : ['General']).join(', '), haPerHour, price, radius, gpsLat || null, gpsLng || null]
       );
-      await updateSession(waFrom, { step: 'main_menu', user_type: 'unknown', data: {} });
-      return '✅ *Registration complete!* You are now a DigiLync service provider.\n\nReply *MENU* for options.';
+      const providerId = ins.rows[0].id;
+      await updateSession(waFrom, {
+        step: 'privacy_consent_new',
+        user_type: 'unknown',
+        data: { privacy_pending: { role: 'provider', id: providerId } },
+      });
+      return getPrivacyConsentPostRegisterMessage();
     } catch (err) {
       console.error('Provider registration error:', err);
       return 'Sorry, registration failed. Please try again.';
