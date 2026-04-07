@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo   DigiLync - Expose localhost for WhatsApp
+echo   Farmfleet - Expose localhost for WhatsApp
 echo ========================================
 echo.
 echo Make sure your backend is running first: npm run dev

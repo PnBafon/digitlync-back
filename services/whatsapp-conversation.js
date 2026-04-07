@@ -1,5 +1,5 @@
 /**
- * DigiLync WhatsApp Bot – Structured Flow
+ * Farmfleet WhatsApp Bot – Structured Flow
  * Batched messaging, low cost, fast onboarding, structured data.
  */
 const { pool } = require('../config/db');
@@ -137,7 +137,7 @@ async function createBookingAndNotify(waFrom, existing, provider, data) {
 
 function getMainMenu(existing = null) {
   return (
-    'Welcome to DigiLync 🌱\n\n' +
+    'Welcome to Farmfleet 🌱\n\n' +
     'What would you like to do?\n\n' +
     '1. Register as Farmer\n' +
     '2. Register as Service Provider\n' +
@@ -151,7 +151,7 @@ function getMainMenu(existing = null) {
 
 function getHelpMessage() {
   return (
-    '📘 *DigiLync Help*\n\n' +
+    '📘 *Farmfleet Help*\n\n' +
     '• *Register* – Sign up as farmer or service provider\n' +
     '• *Request* – Order farm services (ploughing, spraying, etc.)\n' +
     '• *My Requests* – View your bookings\n' +
@@ -165,7 +165,7 @@ function getHelpMessage() {
 function getPrivacyConsentPostRegisterMessage() {
   return (
     '🔒 *Your privacy matters*\n\n' +
-    'DigiLync takes your personal information seriously. We use it only to deliver and improve our services: coordinating agricultural services, enabling access to service-based credit where applicable, and supporting secure transactions.\n\n' +
+    'Farmfleet takes your personal information seriously. We use it only to deliver and improve our services: coordinating agricultural services, enabling access to service-based credit where applicable, and supporting secure transactions.\n\n' +
     'We do not sell your data. We do not share it with third parties without your permission, except where necessary to provide the service or to meet legal obligations.\n\n' +
     'By continuing, you agree to the collection and use of your data as described above and in our Privacy Policy (digilync.com/privacy).\n\n' +
     '*Do you consent?*\n\n' +
@@ -210,9 +210,9 @@ async function handlePrivacyConsentPostRegister(waFrom, text, data) {
   if (agreed) {
     await updateSession(waFrom, { step: 'main_menu', data: {} });
     if (pending.role === 'farmer') {
-      return '✅ *Registration complete!* You are now a DigiLync farmer.\n\nReply *MENU* for options.';
+      return '✅ *Registration complete!* You are now a Farmfleet farmer.\n\nReply *MENU* for options.';
     }
-    return '✅ *Registration complete!* You are now a DigiLync service provider.\n\nReply *MENU* for options.';
+    return '✅ *Registration complete!* You are now a Farmfleet service provider.\n\nReply *MENU* for options.';
   }
 
   return 'Please reply *1* to Agree or *2* to Disagree.';
@@ -304,7 +304,7 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
     }
     if (text === '2') {
       await updateSession(waFrom, { step: 'main_menu', data: {} });
-      return 'To edit farm details, please contact the admin team or use the DigiLync web portal.\n\nReply *MENU* for options.';
+      return 'To edit farm details, please contact the admin team or use the Farmfleet web portal.\n\nReply *MENU* for options.';
     }
     if (text === '3') {
       return handleAddAnotherFarm(waFrom, existing);
@@ -408,7 +408,7 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
 
 function getFarmerBasicMessage() {
   return (
-    'Welcome to DigiLync 🌱\n' +
+    'Welcome to Farmfleet 🌱\n' +
     "Let's register your farm.\n\n" +
     'Please reply in this format:\n\n' +
     'Name:\n' +
@@ -495,6 +495,24 @@ function parseKeyValueBlock(text) {
     }
   }
   return result;
+}
+
+/** Map alternate label keys (e.g. from "Farm size (hectares):") to canonical fields */
+function getFarmDetailsFields(kv) {
+  const farmSizeRaw =
+    kv.farm_size ||
+    kv.farm_size_hectares ||
+    kv['farm_size_(hectares)'] ||
+    kv['farm_size_(ha)'] ||
+    '';
+  const crop =
+    kv.crop ||
+    kv.crops ||
+    kv['crop(s)'] ||
+    kv['crop_type'] ||
+    '';
+  const servicesRaw = kv.services || kv.service || kv['service(s)'] || '';
+  return { farmSizeRaw, crop, servicesRaw };
 }
 
 async function handleFarmerFlow(waFrom, session, data, text, latitude, longitude) {
@@ -601,9 +619,8 @@ async function handleFarmerFlow(waFrom, session, data, text, latitude, longitude
 
     case 'farmer_farm_details': {
       const kv = parseKeyValueBlock(text);
-      const farmSize = parseFloat(kv.farm_size || kv.farm_size_hectares || '');
-      const crop = kv.crop || kv.crops || '';
-      const servicesRaw = kv.services || kv.service || '';
+      const { farmSizeRaw, crop, servicesRaw } = getFarmDetailsFields(kv);
+      const farmSize = parseFloat(farmSizeRaw);
       if (isNaN(farmSize) || farmSize < 0) return 'Please include *Farm size:* (number). Example: Farm size: 2.5';
       const serviceNums = servicesRaw.replace(/[^\d,]/g, '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n >= 1 && n <= 9);
       const services = serviceNums.map((n) => SERVICE_LIST[n - 1]).filter(Boolean);
@@ -644,8 +661,9 @@ async function handleFarmerFlow(waFrom, session, data, text, latitude, longitude
       }
       return 'Reply *1* for Yes or *2* for No.';
 
-    case 'farmer_confirm':
-      if (text === '1' || text.toLowerCase() === 'confirm') {
+    case 'farmer_confirm': {
+      const confirmYes = ['1', 'confirm', 'yes', 'ok', 'y'].includes(text.trim().toLowerCase());
+      if (confirmYes) {
         try {
           const village = [data.region, data.division, data.district].filter(Boolean).join(', ') || data.district || data.region || 'Not specified';
           const serviceNeeds = data.services && data.services.length ? data.services : [data.crop_type || 'General'];
@@ -704,6 +722,7 @@ async function handleFarmerFlow(waFrom, session, data, text, latitude, longitude
         return getFarmerBasicMessage();
       }
       return 'Reply *1* to Confirm or *2* to Edit.';
+    }
 
     default:
       await updateSession(waFrom, { step: 'main_menu', data: {} });
@@ -1118,7 +1137,7 @@ async function handleUnsubscribeConfirm(waFrom, existing, text) {
         await pool.query('DELETE FROM providers WHERE id = $1', [existing.id]);
       }
       await pool.query('DELETE FROM whatsapp_sessions WHERE wa_phone = $1', [normalizePhone(waFrom)]);
-      return 'Your account has been successfully removed from DigiLync.\n\nThank you for using our service.';
+      return 'Your account has been successfully removed from Farmfleet.\n\nThank you for using our service.';
     } catch (err) {
       console.error('Unsubscribe error:', err);
       return 'Sorry, we could not complete your request. Please try again later.';
