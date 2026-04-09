@@ -2,6 +2,7 @@
  * Digilync WhatsApp Bot – Structured Flow
  * Batched messaging, low cost, fast onboarding, structured data.
  */
+const crypto = require('crypto');
 const { pool } = require('../config/db');
 const { sendBrandedText } = require('./whatsapp-sender');
 const { haversineDistanceKm } = require('../utils/geo');
@@ -57,6 +58,74 @@ async function findExistingUser(phone) {
   );
   if (provider.rows.length > 0) return { type: 'provider', id: provider.rows[0].id, name: provider.rows[0].full_name };
   return null;
+}
+
+/**
+ * Insert farmer + plot, notify on WhatsApp. Used by web GPS POST and optional WhatsApp location pin.
+ */
+async function finalizeFarmerRegistrationFromPendingGps(waPhone, pending, lat, lng, { source = 'web' } = {}) {
+  const latN = parseFloat(lat);
+  const lngN = parseFloat(lng);
+  if (Number.isNaN(latN) || Number.isNaN(lngN) || latN < -90 || latN > 90 || lngN < -180 || lngN > 180) {
+    return { ok: false, error: 'invalid_coords' };
+  }
+  const digits = phoneDigits(normalizePhone(waPhone));
+  const dup = await pool.query(
+    "SELECT id FROM farmers WHERE REGEXP_REPLACE(phone, '[^0-9]', '', 'g') = $1",
+    [digits]
+  );
+  if (dup.rows.length > 0) {
+    return { ok: false, error: 'duplicate' };
+  }
+  const phoneCanonical = normalizePhone(waPhone);
+  const village = (pending.village || '').trim() || 'Not specified';
+  const notesParts = [];
+  if (pending.phone_entered && phoneDigits(pending.phone_entered) !== digits) {
+    notesParts.push(`Phone (as entered): ${pending.phone_entered}`);
+  }
+  notesParts.push(
+    source === 'whatsapp'
+      ? 'Registered via WhatsApp + location pin.'
+      : 'Registered via WhatsApp + web GPS capture.'
+  );
+  const notes = notesParts.join('\n');
+  const cropType = (pending.crop_type || '').trim() || 'Not specified';
+  const serviceNeeds = [cropType];
+  try {
+    const ins = await pool.query(
+      `INSERT INTO farmers (full_name, phone, village, location, gps_lat, gps_lng, farm_size_ha, crop_type, service_needs, consent_to_data_use, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+      [
+        String(pending.full_name).trim(),
+        phoneCanonical,
+        village,
+        village,
+        latN,
+        lngN,
+        pending.farm_size_ha,
+        cropType,
+        serviceNeeds,
+        true,
+        notes,
+      ]
+    );
+    const farmerId = ins.rows[0].id;
+    await pool.query(
+      `INSERT INTO farm_plots (farmer_id, gps_lat, gps_lng, plot_name, plot_size_ha, crop_type)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [farmerId, latN, lngN, 'Farm 1', pending.farm_size_ha, cropType]
+    );
+    await updateSession(waPhone, { step: 'main_menu', user_type: 'unknown', data: {} });
+    const existing = await findExistingUser(phoneCanonical);
+    const menu = getMainMenu(existing);
+    const body = `Registration Successful\n\n${menu}`;
+    const to = `whatsapp:${digits}`;
+    await sendBrandedText(to, body);
+    return { ok: true, farmer_id: farmerId };
+  } catch (err) {
+    console.error('finalizeFarmerRegistrationFromPendingGps:', err);
+    return { ok: false, error: 'db' };
+  }
 }
 
 async function findMatchingProviders(serviceType, farmerLat, farmerLng) {
@@ -135,9 +204,9 @@ async function createBookingAndNotify(waFrom, existing, provider, data) {
   }
 }
 
-function getMainMenu(existing = null) {
+function getMainMenu(_existing = null) {
   return (
-    'Welcome 🌱\n\n' +
+    'Welcome\n\n' +
     'What would you like to do?\n\n' +
     '1. Register as Farmer\n' +
     '2. Register as Service Provider\n' +
@@ -149,14 +218,64 @@ function getMainMenu(existing = null) {
   );
 }
 
+/** Base URL for web app links (GPS capture page). Uses FRONTEND_URL from .env (same as CORS). */
+function getFrontendBaseUrl() {
+  const u = process.env.FRONTEND_URL || 'https://digilync.net';
+  return String(u).replace(/\/$/, '');
+}
+
+function getFarmerWaRegistrationPrompt() {
+  return (
+    'Enter Your Full Name:\n' +
+    'Enter Your Phone Number:\n' +
+    'Enter Your Village/Location:\n\n' +
+    'Enter Farm Size:\n' +
+    'Enter Crop Type:\n\n' +
+    'Send one message with each line filled in, e.g. *Full Name:* Jane … *Phone Number:* …'
+  );
+}
+
+function parseFarmerWaRegistrationForm(text) {
+  const kv = parseKeyValueBlock(text);
+  const fullName = (
+    kv.full_name ||
+    kv.name ||
+    kv.enter_your_full_name ||
+    ''
+  ).trim();
+  const phoneEntered = (
+    kv.phone_number ||
+    kv.phone ||
+    kv.enter_your_phone_number ||
+    ''
+  ).trim();
+  const village = (
+    kv.village_location ||
+    kv.village ||
+    kv.location ||
+    kv['enter_your_village/location'] ||
+    kv.enter_your_village_location ||
+    ''
+  ).trim();
+  const farmSizeRaw = kv.farm_size || kv.enter_farm_size || '';
+  const crop = (
+    kv.crop_type ||
+    kv.crop ||
+    kv.enter_crop_type ||
+    ''
+  ).trim();
+  return { fullName, phoneEntered, village, farmSizeRaw, crop };
+}
+
 function getHelpMessage() {
   return (
     '📘 *Help*\n\n' +
-    '• *Register* – Sign up as farmer or service provider\n' +
-    '• *Request* – Order farm services (ploughing, spraying, etc.)\n' +
-    '• *My Requests* – View your bookings\n' +
-    '• *Recap* – View your registered farms\n' +
-    '• *Unsubscribe* – Delete your account\n\n' +
+    '• *1 Farmer* – Send your details, then open the *GPS link* to drop your farm pin\n' +
+    '• *2 Provider* – Reply with your service profile, then share your base location\n' +
+    '• *3 Request* – Book a service (farmers only)\n' +
+    '• *4 My Requests* – Your bookings / jobs\n' +
+    '• *7 Recap* – See your saved farms or profile\n' +
+    '• *6 Unsubscribe* – Remove your account\n\n' +
     'Reply *MENU* to go back.'
   );
 }
@@ -178,6 +297,9 @@ async function handlePrivacyConsentPostRegister(waFrom, text, data) {
   const pending = data.privacy_pending;
   const phone = normalizePhone(waFrom);
   const t = text.trim().toLowerCase();
+  if (['help', '?'].includes(t)) {
+    return getHelpMessage();
+  }
   if (!pending || !pending.role || !pending.id) {
     await updateSession(waFrom, { step: 'main_menu', data: {} });
     const existing = await findExistingUser(phone);
@@ -268,14 +390,74 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
   const session = await getSession(waFrom);
   const data = typeof session.data === 'object' ? session.data : (session.data ? JSON.parse(session.data) : {});
 
+  const inActiveFlow =
+    (session.step &&
+      (session.step.startsWith('farmer_') ||
+        session.step.startsWith('provider_') ||
+        session.step.startsWith('request_') ||
+        session.step === 'add_farm_details' ||
+        session.step === 'unsubscribe_confirm' ||
+        session.step === 'recap_options' ||
+        session.step === 'privacy_consent_new')) ||
+    false;
+
+  // Reset to main menu from anywhere (including exiting privacy consent)
+  if (['menu', 'start', '0', 'hi', 'hello'].includes(textLower)) {
+    if (session.step === 'privacy_consent_new' && data.privacy_pending?.role && data.privacy_pending?.id) {
+      try {
+        if (data.privacy_pending.role === 'farmer') {
+          await pool.query('DELETE FROM farm_plots WHERE farmer_id = $1', [data.privacy_pending.id]);
+          await pool.query('DELETE FROM bookings WHERE farmer_id = $1', [data.privacy_pending.id]);
+          await pool.query('DELETE FROM farmers WHERE id = $1', [data.privacy_pending.id]);
+        } else if (data.privacy_pending.role === 'provider') {
+          await pool.query('UPDATE bookings SET provider_id = NULL WHERE provider_id = $1', [data.privacy_pending.id]);
+          await pool.query('DELETE FROM providers WHERE id = $1', [data.privacy_pending.id]);
+        }
+      } catch (e) {
+        console.error('Menu exit privacy cleanup error:', e);
+      }
+    }
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    const ex = await findExistingUser(phone);
+    return getMainMenu(ex);
+  }
+
   if (session.step === 'privacy_consent_new') {
     return handlePrivacyConsentPostRegister(waFrom, text, data);
   }
 
-  // Main menu triggers
-  if (['hi', 'hello', 'menu', 'start', '0', '5'].includes(textLower)) {
-    if (textLower === '5') return getHelpMessage();
-    return getMainMenu(existing);
+  if (['help', '?'].includes(textLower)) {
+    return getHelpMessage();
+  }
+
+  // Help: "5" only when not in a flow where "5" might be real input (e.g. farm size)
+  if (textLower === '5' && !inActiveFlow) {
+    return getHelpMessage();
+  }
+
+  // Unregistered: switch Farmer ↔ Provider signup or resend GPS link
+  if (!existing) {
+    const t = text.trim();
+    if (session.step === 'farmer_await_gps_web' && t === '1' && data.gps_token && data.pending_farmer) {
+      const gpsUrl = `${getFrontendBaseUrl()}/gps?t=${encodeURIComponent(data.gps_token)}`;
+      return (
+        `🔗 *Click to enter GPS:*\n${gpsUrl}\n\n` +
+        'Or send your *location pin* in WhatsApp (📎 → Location).\n\n' +
+        'Reply *MENU* to cancel.'
+      );
+    }
+    if (t === '2' && session.step === 'farmer_wa_form') {
+      await updateSession(waFrom, { user_type: 'provider', step: 'provider_batched', data: {} });
+      return 'Switched to *Service Provider* registration.\n\n' + getProviderBatchedMessage();
+    }
+    if (t === '1' && session.step === 'provider_batched') {
+      await updateSession(waFrom, { user_type: 'farmer', step: 'farmer_wa_form', data: {} });
+      return 'Switched to *Farmer* registration.\n\n' + getFarmerWaRegistrationPrompt();
+    }
+    if (t === '2' && session.step === 'farmer_await_gps_web') {
+      await updateSession(waFrom, { user_type: 'provider', step: 'provider_batched', data: {} });
+      return 'Cancelled the farmer GPS step. Starting *Service Provider* registration.\n\n' + getProviderBatchedMessage();
+    }
   }
 
   // In-flow handlers (must run BEFORE main menu option checks, so "1" in unsubscribe_confirm is not mistaken for "Register as Farmer")
@@ -319,6 +501,18 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
     if (text === '5') return getHelpMessage();
     if (text === '6') return handleUnsubscribeFlow(waFrom, existing);
     if (text === '7') return handleRecap(waFrom, existing, true);
+    if (text === '1' && existing.type === 'provider') {
+      return (
+        'You are already registered as a *service provider*. To register as a farmer, use a different WhatsApp number or contact support.\n\n' +
+        'Reply *MENU* for options.'
+      );
+    }
+    if (text === '2' && existing.type === 'farmer') {
+      return (
+        'You are already registered as a *farmer*. To sign up as a service provider, use a different WhatsApp number or contact support.\n\n' +
+        'Reply *MENU* for options.'
+      );
+    }
     if (existing.type === 'farmer' && text === '3') {
       const farms = await getFarmerFarms(existing.id);
       if (farms.length === 0) {
@@ -362,8 +556,8 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
         session.step === 'add_farm_details');
     if (!inOnboarding) {
       if (text === '1') {
-        await updateSession(waFrom, { user_type: 'farmer', step: 'farmer_basic', data: {} });
-        return getFarmerBasicMessage();
+        await updateSession(waFrom, { user_type: 'farmer', step: 'farmer_wa_form', data: {} });
+        return getFarmerWaRegistrationPrompt();
       }
       if (text === '2') {
         await updateSession(waFrom, { user_type: 'provider', step: 'provider_batched', data: {} });
@@ -414,66 +608,6 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
   return getMainMenu(existing);
 }
 
-function getFarmerBasicMessage() {
-  return (
-    "Let's register your farm.\n\n" +
-    'Send each field using the label *Name:* on its own line, then your answer on the same line or the next line:\n\n' +
-    'Name:\n' +
-    'Region:\n' +
-    'Division:\n' +
-    'Subdivision:\n' +
-    'District:\n\n' +
-    '*Example:*\n' +
-    'Name: John\n' +
-    'Region: South West\n' +
-    'Division: Meme\n' +
-    'Subdivision: Kumba\n' +
-    'District: Kumba 1'
-  );
-}
-
-function getFarmerShareLocationMessage() {
-  return (
-    '📍 *Farm location*\n\n' +
-    'Turn on *Location* (GPS) on your phone, then:\n' +
-    '• Tap *📎* → *Location* → *Send your current location*\n\n' +
-    'Or type coordinates on one line:\n' +
-    '*Example:* 4.6382, 9.4469\n\n' +
-    'Or reply *SKIP* to continue without GPS.'
-  );
-}
-
-function getFarmerGpsConfirmMessage(locationName, lat, lng) {
-  const locStr = locationName ? `${locationName} (${lat.toFixed(4)}, ${lng.toFixed(4)})` : `(${lat.toFixed(4)}, ${lng.toFixed(4)})`;
-  return (
-    `Location received: ${locStr}\n\n` +
-    '1. Confirm\n' +
-    '2. Re-enter'
-  );
-}
-
-/** Parse DMS (Degrees Minutes Seconds) format to decimal lat/lng */
-function parseDmsToDecimal(text) {
-  if (!text || typeof text !== 'string') return null;
-  const t = text.trim();
-  // Match patterns like: 4°38'N, 9°26'E  or  4 38 N, 9 26 E  or  4°38' N, 9°26' E
-  const dmsRegex = /(-?\d+)[°\s]*(\d+)[°\'′\s]*([NS])?\s*[,;]\s*(-?\d+)[°\s]*(\d+)[°\'′\s]*([EW])?/i;
-  const m = t.match(dmsRegex);
-  if (!m) return null;
-  const latDeg = parseInt(m[1], 10);
-  const latMin = parseInt(m[2], 10);
-  const latDir = (m[3] || 'N').toUpperCase();
-  const lngDeg = parseInt(m[4], 10);
-  const lngMin = parseInt(m[5], 10);
-  const lngDir = (m[6] || 'E').toUpperCase();
-  let lat = latDeg + latMin / 60;
-  let lng = lngDeg + lngMin / 60;
-  if (latDir === 'S') lat = -lat;
-  if (lngDir === 'W') lng = -lng;
-  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
-  return { latitude: lat, longitude: lng };
-}
-
 function parseKeyValueBlock(text) {
   const result = {};
   if (!text || typeof text !== 'string') return result;
@@ -500,252 +634,73 @@ function parseKeyValueBlock(text) {
   return result;
 }
 
-/** Map alternate label keys (e.g. from "Farm size (hectares):") to canonical fields */
-function getFarmDetailsFields(kv) {
-  const farmSizeRaw =
-    kv.farm_size ||
-    kv.farm_size_hectares ||
-    kv['farm_size_(hectares)'] ||
-    kv['farm_size_(ha)'] ||
-    '';
-  const crop =
-    kv.crop ||
-    kv.crops ||
-    kv['crop(s)'] ||
-    kv['crop_type'] ||
-    '';
-  const servicesRaw = kv.services || kv.service || kv['service(s)'] || '';
-  return { farmSizeRaw, crop, servicesRaw };
-}
-
 async function handleFarmerFlow(waFrom, session, data, text, latitude, longitude) {
   const phone = normalizePhone(waFrom);
 
   switch (session.step) {
-    case 'farmer_basic': {
-      const kv = parseKeyValueBlock(text);
-      const name = kv.name || kv.full_name;
-      if (!name) {
-        return 'Please include *Name:* and your area details.\n\n' + getFarmerBasicMessage();
+    case 'farmer_wa_form': {
+      const parsed = parseFarmerWaRegistrationForm(text);
+      const farmSize = parseFloat(parsed.farmSizeRaw);
+      if (
+        !parsed.fullName ||
+        !parsed.phoneEntered ||
+        !parsed.village ||
+        !parsed.crop ||
+        Number.isNaN(farmSize) ||
+        farmSize < 0
+      ) {
+        return (
+          'Please send *all* fields: full name, phone, village/location, farm size (number), and crop type.\n\n' +
+          getFarmerWaRegistrationPrompt()
+        );
       }
+      const token = crypto.randomUUID();
+      const gpsUrl = `${getFrontendBaseUrl()}/gps?t=${encodeURIComponent(token)}`;
       await updateSession(waFrom, {
-        step: 'farmer_gps_share',
+        step: 'farmer_await_gps_web',
+        user_type: 'farmer',
         data: {
-          full_name: name,
-          region: kv.region || '',
-          division: kv.division || '',
-          subdivision: kv.subdivision || '',
-          district: kv.district || '',
-        },
-      });
-      return getFarmerShareLocationMessage();
-    }
-
-    case 'farmer_gps_share': {
-      if (text.toLowerCase() === 'skip') {
-        await updateSession(waFrom, {
-          step: 'farmer_farm_details',
-          data: { ...data, gps_lat: null, gps_lng: null },
-        });
-        return getFarmerFarmDetailsMessage();
-      }
-      if (latitude != null && longitude != null) {
-        const lat = parseFloat(latitude);
-        const lng = parseFloat(longitude);
-        await updateSession(waFrom, {
-          step: 'farmer_gps_confirm',
-          data: {
-            ...data,
-            gps_lat: lat,
-            gps_lng: lng,
+          gps_token: token,
+          pending_farmer: {
+            full_name: parsed.fullName,
+            phone_entered: parsed.phoneEntered,
+            village: parsed.village,
+            farm_size_ha: farmSize,
+            crop_type: parsed.crop,
           },
-        });
-        return getFarmerGpsConfirmMessage(data.district || data.region || 'Your location', lat, lng);
-      }
-      const decMatch = text.trim().match(/^(-?\d+\.?\d*)\s*[,]\s*(-?\d+\.?\d*)$/);
-      if (decMatch) {
-        const lat = parseFloat(decMatch[1]);
-        const lng = parseFloat(decMatch[2]);
-        if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
-          await updateSession(waFrom, {
-            step: 'farmer_gps_confirm',
-            data: { ...data, gps_lat: lat, gps_lng: lng },
-          });
-          return getFarmerGpsConfirmMessage(data.district || data.region || 'Your location', lat, lng);
-        }
-        return 'Invalid coordinates. Latitude −90 to 90, Longitude −180 to 180.\n\n' + getFarmerShareLocationMessage();
-      }
-      const parsedDms = parseDmsToDecimal(text);
-      if (parsedDms) {
-        await updateSession(waFrom, {
-          step: 'farmer_gps_confirm',
-          data: {
-            ...data,
-            gps_lat: parsedDms.latitude,
-            gps_lng: parsedDms.longitude,
-          },
-        });
-        return getFarmerGpsConfirmMessage(data.district || data.region || 'Your location', parsedDms.latitude, parsedDms.longitude);
-      }
-      return 'We could not read your location. Turn on GPS and send your *pin* (📎 → Location), or type *lat, lng* (e.g. 4.6382, 9.4469), or *SKIP*.\n\n' + getFarmerShareLocationMessage();
-    }
-
-    case 'farmer_gps_confirm':
-      if (text === '1' || text.toLowerCase() === 'confirm') {
-        await updateSession(waFrom, { step: 'farmer_farm_details', data });
-        return getFarmerFarmDetailsMessage();
-      }
-      if (text === '2' || text.toLowerCase() === 're-enter' || text.toLowerCase() === 'reenter') {
-        await updateSession(waFrom, { step: 'farmer_gps_share', data: { ...data, gps_lat: null, gps_lng: null } });
-        return getFarmerShareLocationMessage();
-      }
-      return 'Reply *1* to Confirm or *2* to Re-enter location.';
-
-    case 'farmer_farm_details': {
-      const kv = parseKeyValueBlock(text);
-      const { farmSizeRaw, crop, servicesRaw } = getFarmDetailsFields(kv);
-      const farmSize = parseFloat(farmSizeRaw);
-      if (isNaN(farmSize) || farmSize < 0) return 'Please include *Farm size:* with a number.\n\n' + getFarmerFarmDetailsMessage();
-      const serviceNums = servicesRaw.replace(/[^\d,]/g, '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n >= 1 && n <= 9);
-      const services = serviceNums.map((n) => SERVICE_LIST[n - 1]).filter(Boolean);
-      const hasOther = serviceNums.includes(9);
-      await updateSession(waFrom, {
-        step: hasOther ? 'farmer_other_services' : 'farmer_multi_farm',
-        data: {
-          ...data,
-          farm_size_ha: farmSize,
-          crop_type: crop || 'Not specified',
-          services,
-          service_nums: serviceNums,
         },
       });
-      if (hasOther) return 'You selected "Other".\n\nPlease type additional service(s):\n*Example:*\nDrone spraying, Soil testing';
-      return getFarmerMultiFarmMessage();
+      return (
+        '✅ Details received.\n\n' +
+        `🔗 *Click to enter GPS:*\n${gpsUrl}\n\n` +
+        'Open the link, allow location when your browser asks, and your farm pin will be saved automatically.\n\n' +
+        'We will confirm here when GPS is saved.\n\n' +
+        'Reply *MENU* to cancel.'
+      );
     }
 
-    case 'farmer_other_services':
-      const otherServices = text.trim();
-      await updateSession(waFrom, {
-        step: 'farmer_multi_farm',
-        data: {
-          ...data,
-          services: [...(data.services || []), otherServices].filter(Boolean),
-        },
-      });
-      return getFarmerMultiFarmMessage();
-
-    case 'farmer_multi_farm':
-      if (text === '1' || text.toLowerCase() === 'yes') {
-        await updateSession(waFrom, { step: 'farmer_farm_details', data: { ...data, farms: [...(data.farms || []), { farm_size_ha: data.farm_size_ha, crop_type: data.crop_type, services: data.services }] } });
-        return getFarmerFarmDetailsMessage();
-      }
-      if (text === '2' || text.toLowerCase() === 'no') {
-        await updateSession(waFrom, { step: 'farmer_confirm', data: data });
-        return getFarmerConfirmMessage(data);
-      }
-      return 'Reply *1* for Yes or *2* for No.';
-
-    case 'farmer_confirm': {
-      const confirmYes = ['1', 'confirm', 'yes', 'ok', 'y'].includes(text.trim().toLowerCase());
-      if (confirmYes) {
-        try {
-          const village = [data.region, data.division, data.district].filter(Boolean).join(', ') || data.district || data.region || 'Not specified';
-          const serviceNeeds = data.services && data.services.length ? data.services : [data.crop_type || 'General'];
-          const allFarms = [...(data.farms || []), { farm_size_ha: data.farm_size_ha, crop_type: data.crop_type, services: data.services }];
-          const firstFarm = allFarms[0] || {};
-          const ins = await pool.query(
-            `INSERT INTO farmers (full_name, phone, region, division, subdivision, district, village, location, gps_lat, gps_lng, farm_size_ha, crop_type, service_needs)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
-            [
-              data.full_name,
-              phone,
-              data.region || null,
-              data.division || null,
-              data.subdivision || null,
-              data.district || null,
-              village,
-              village,
-              data.gps_lat || null,
-              data.gps_lng || null,
-              firstFarm.farm_size_ha || null,
-              firstFarm.crop_type || null,
-              serviceNeeds,
-            ]
-          );
-          const farmerId = ins.rows[0].id;
-          const gpsLat = data.gps_lat != null ? data.gps_lat : 0;
-          const gpsLng = data.gps_lng != null ? data.gps_lng : 0;
-          for (let i = 0; i < allFarms.length; i++) {
-            const farm = allFarms[i];
-            await pool.query(
-              `INSERT INTO farm_plots (farmer_id, gps_lat, gps_lng, plot_name, plot_size_ha, crop_type)
-               VALUES ($1, $2, $3, $4, $5, $6)`,
-              [
-                farmerId,
-                gpsLat,
-                gpsLng,
-                `Farm ${i + 1}`,
-                farm.farm_size_ha || null,
-                farm.crop_type || null,
-              ]
-            );
-          }
-          await updateSession(waFrom, {
-            step: 'privacy_consent_new',
-            user_type: 'unknown',
-            data: { privacy_pending: { role: 'farmer', id: farmerId } },
-          });
-          return getPrivacyConsentPostRegisterMessage();
-        } catch (err) {
-          console.error('Farmer registration error:', err);
-          return 'Sorry, registration failed. Please try again.';
+    case 'farmer_await_gps_web': {
+      if (latitude != null && longitude != null && data.pending_farmer) {
+        const r = await finalizeFarmerRegistrationFromPendingGps(phone, data.pending_farmer, latitude, longitude, {
+          source: 'whatsapp',
+        });
+        if (r.ok) return null;
+        if (r.error === 'duplicate') {
+          return 'This WhatsApp number is already registered as a farmer. Reply *MENU* for options.';
         }
+        return 'We could not save your location. Try the web link again or send *MENU*.';
       }
-      if (text === '2' || text.toLowerCase() === 'edit') {
-        await updateSession(waFrom, { step: 'farmer_basic', data: {} });
-        return getFarmerBasicMessage();
-      }
-      return 'Reply *1* to Confirm or *2* to Edit.';
+      return (
+        '📍 *Waiting for your farm GPS*\n\n' +
+        'Use the *Click to enter GPS* link we sent, or send your *location pin* here (📎 → Location).\n\n' +
+        'Reply *1* to resend the link. Reply *MENU* to cancel.'
+      );
     }
 
     default:
       await updateSession(waFrom, { step: 'main_menu', data: {} });
-      return getMainMenu();
+      return getMainMenu(await findExistingUser(phone));
   }
-}
-
-function getFarmerFarmDetailsMessage() {
-  return (
-    'Farm details — use the labels (answer on the same line or the next line):\n\n' +
-    'Farm size:\n' +
-    'Crop:\n' +
-    'Services:\n\n' +
-    'Services: pick numbers separated by commas:\n\n' +
-    '1. Ploughing\n2. Planting\n3. Spraying\n4. Irrigation\n5. Harvesting\n' +
-    '6. Processing\n7. Storage\n8. Transport\n9. Other\n\n' +
-    '*Example:*\n' +
-    'Farm size: 2.5\n' +
-    'Crop: Maize, Cassava\n' +
-    'Services: 1,3,5'
-  );
-}
-
-function getFarmerMultiFarmMessage() {
-  return 'Do you have another farm?\n\n1. Yes\n2. No';
-}
-
-function getFarmerConfirmMessage(data) {
-  const loc = data.gps_lat ? `${data.gps_lat}, ${data.gps_lng}` : 'Not set';
-  return (
-    'Please confirm your details:\n\n' +
-    `Name: ${data.full_name}\n` +
-    `Location: ${data.district || data.region || '—'}\n` +
-    `Farm size: ${data.farm_size_ha} ha\n` +
-    `Crop: ${data.crop_type || '—'}\n` +
-    `Services: ${(data.services || []).join(', ') || '—'}\n` +
-    `GPS: ${loc}\n\n` +
-    '1. Confirm\n2. Edit'
-  );
 }
 
 function getProviderBatchedMessage() {
@@ -1259,4 +1214,7 @@ module.exports = {
   normalizePhone,
   getSession,
   updateSession,
+  findExistingUser,
+  getMainMenu,
+  finalizeFarmerRegistrationFromPendingGps,
 };

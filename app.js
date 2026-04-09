@@ -71,6 +71,7 @@ app.use('/api/ratings', require('./routes/ratings'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/audit-logs', require('./routes/audit-logs'));
 app.use('/api/public', require('./routes/public-metrics'));
+app.use('/api/public', require('./routes/public-farmer-gps'));
 app.use('/api/farm-plots', require('./routes/farm-plots'));
 app.use('/api/whatsapp', require('./routes/whatsapp-webhook'));
 
