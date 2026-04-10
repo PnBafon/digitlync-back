@@ -18,11 +18,11 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-async function post(body) {
+async function post(payload) {
   const res = await fetchWithTimeout(`${BASE}/api/whatsapp/simulate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || res.statusText);
@@ -55,17 +55,15 @@ async function run() {
         'Division: Meme\n' +
         'Subdivision: Kumba\n' +
         'District: Kumba 1',
-      desc: 'Structured location (farmer_basic)',
+      desc: 'Structured basic info (admin areas)',
     },
-    { body: '4.6382, 9.4469', desc: 'GPS coordinates (decimal, after location prompt)' },
-    { body: '1', desc: 'Confirm GPS' },
+    { from, body: '', latitude: 4.6382, longitude: 9.4469, desc: 'GPS as WhatsApp location (simulator)' },
     {
       body: 'Farm size: 2.5\nCrop: Maize\nServices: 1,3',
       desc: 'Farm details (size, crop, services)',
     },
     { body: '2', desc: 'No additional farm' },
-    { body: 'yes', desc: 'Confirm registration (synonym for 1)' },
-    { body: '1', desc: 'Privacy consent Agree' },
+    { body: '1', desc: 'Confirm registration' },
   ];
 
   console.log('Testing WhatsApp bot via simulator at', BASE);
@@ -79,9 +77,15 @@ async function run() {
 
   for (const step of steps) {
     try {
-      const { reply } = await post({ from, body: step.body });
+      const payload = {
+        from: step.from || from,
+        body: step.body ?? '',
+        ...(step.latitude != null ? { latitude: step.latitude, longitude: step.longitude } : {}),
+      };
+      const { reply } = await post(payload);
       console.log(`[${step.desc}]`);
-      console.log(`  send: ${JSON.stringify(step.body).slice(0, 120)}${step.body.length > 120 ? '…' : ''}`);
+      const preview = JSON.stringify({ body: step.body, lat: step.latitude, lng: step.longitude }).slice(0, 120);
+      console.log(`  send: ${preview}${preview.length >= 120 ? '…' : ''}`);
       console.log(`  → ${(reply || '(no reply)').split('\n')[0]}`);
       console.log('');
     } catch (err) {
@@ -92,7 +96,7 @@ async function run() {
   }
 
   console.log('---');
-  console.log('All steps passed. Farmer registration flow completed locally.');
+  console.log('All steps completed. (If a step shows "(no reply)", the bot may have sent the next prompt via a follow-up message path.)');
 }
 
 run();

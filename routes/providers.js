@@ -194,7 +194,7 @@ router.patch('/:id', async (req, res) => {
 });
 
 router.put('/:id', async (req, res) => {
-  const { full_name, phone } = req.body || {};
+  const { full_name, phone, services } = req.body || {};
   if (!full_name || !phone) return res.status(400).json({ error: 'Full name and phone are required' });
   const p = parseProviderBody(req.body);
   const client = await pool.connect();
