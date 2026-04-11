@@ -325,16 +325,19 @@ async function createBookingAndNotify(waFrom, existing, provider, data) {
   }
 }
 
-function getMainMenu(_existing = null) {
-  return (
+function getMainMenu(existing = null) {
+  let msg =
     'Welcome to DigiLync \u{1F331}\n\n' +
     'What would you like to do?\n\n' +
     '1. Register as Farmer\n' +
     '2. Register as Service Provider\n' +
     '3. Request a Service\n' +
     '4. My Requests\n' +
-    '5. Help'
-  );
+    '5. Help';
+  if (existing) {
+    msg += '\n6. Unsubscribe\n7. Recap';
+  }
+  return msg;
 }
 
 /** Base URL for web app links (GPS capture page). Uses FRONTEND_URL from .env (same as CORS). */
@@ -457,7 +460,10 @@ function getHelpMessage() {
     '• *1 Farmer* — Admin areas + *GPS link* for your farm pin\n' +
     '• *2 Provider* — Your rates & services, then *GPS link* for base location\n' +
     '• *3 Request* — Pick a service & size, then *GPS link* to confirm the job location\n' +
-    '• *4 My Requests* — Your bookings / jobs\n\n' +
+    '• *4 My Requests* — Your bookings / jobs\n' +
+    '• *5* — This help\n' +
+    '• *6 Unsubscribe* — Remove your Digilync registration (registered users)\n' +
+    '• *7 Recap* — See your profile / farms and next actions (registered users)\n\n' +
     'Reply *MENU* to go back.'
   );
 }
@@ -577,7 +583,12 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
       (session.step.startsWith('farmer_') ||
         session.step.startsWith('provider_') ||
         session.step.startsWith('request_') ||
-        session.step === 'privacy_consent_new')) ||
+        session.step === 'privacy_consent_new' ||
+        session.step === 'unsubscribe_confirm' ||
+        session.step === 'recap_options' ||
+        session.step === 'add_farm_details' ||
+        session.step === 'edit_farm_select' ||
+        session.step === 'edit_farm_input')) ||
     false;
 
   // Reset to main menu from anywhere (including exiting privacy consent)
@@ -603,6 +614,26 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
 
   if (session.step === 'privacy_consent_new') {
     return handlePrivacyConsentPostRegister(waFrom, text, data);
+  }
+
+  if (session.step === 'unsubscribe_confirm' && existing) {
+    return handleUnsubscribeConfirm(waFrom, existing, text);
+  }
+
+  if (session.step === 'recap_options' && existing && existing.type === 'farmer') {
+    return handleRecapOptionsFlow(waFrom, existing, text, data);
+  }
+
+  if (session.step === 'add_farm_details' && existing && existing.type === 'farmer') {
+    return handleAddFarmDetails(waFrom, existing, text, data);
+  }
+
+  if (session.step === 'edit_farm_select' && existing && existing.type === 'farmer') {
+    return handleEditFarmSelect(waFrom, existing, text, data);
+  }
+
+  if (session.step === 'edit_farm_input' && existing && existing.type === 'farmer') {
+    return handleEditFarmInput(waFrom, existing, text, data);
   }
 
   if (['help', '?'].includes(textLower)) {
@@ -651,10 +682,12 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
     }
   }
 
-  // Registered user: handle menu options
-  if (existing) {
+  // Registered user: main-menu shortcuts only (do not steal 3–7 during request / provider-pick flows)
+  if (existing && !inActiveFlow) {
     if (text === '4') return handleMyRequests(waFrom, existing);
     if (text === '5') return getHelpMessage();
+    if (text === '6') return handleUnsubscribeFlow(waFrom, existing);
+    if (text === '7') return handleRecap(waFrom, existing, true);
     if (text === '1' && existing.type === 'provider') {
       return (
         'You are already registered as a *service provider*. To register as a farmer, use a different WhatsApp number or contact support.\n\n' +
@@ -721,6 +754,9 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
       }
       if (text === '4') {
         return 'Please register first. Reply *1* for Farmer or *2* for Provider.';
+      }
+      if (text === '6' || text === '7') {
+        return 'That option is available after you register. Reply *1* (Farmer) or *2* (Provider), or *MENU*.';
       }
     }
   }
@@ -1329,6 +1365,130 @@ async function handleAddFarmDetails(waFrom, existing, text, data) {
   }
 }
 
+function getEditFarmSelectMessage(farms) {
+  let msg = '*Which farm would you like to update?*\n\n';
+  farms.forEach((farm, i) => {
+    const loc = farm.location || farm.plot_name || '—';
+    const crop = farm.crop_type || '—';
+    const size = farm.plot_size_ha ?? farm.farm_size_ha ?? '—';
+    msg += `${i + 1}. ${loc} – ${crop} – ${size} ha\n`;
+  });
+  msg += '\nReply with the number. Reply *MENU* to cancel.';
+  return msg;
+}
+
+async function handleRecapOptionsFlow(waFrom, existing, text, data) {
+  const t = text.trim();
+  if (t === '1') {
+    const farms = await getFarmerFarms(existing.id);
+    if (farms.length === 0) {
+      await updateSession(waFrom, { step: 'main_menu', data: {} });
+      return 'No farm on file yet. Reply *MENU* for options.';
+    }
+    if (farms.length > 1) {
+      await updateSession(waFrom, {
+        step: 'request_select_farm',
+        data: { farmer_id: existing.id, farms },
+      });
+      return getRequestSelectFarmMessage(farms);
+    }
+    const farm = farms[0];
+    await updateSession(waFrom, {
+      step: 'request_input',
+      data: {
+        farmer_id: existing.id,
+        farm_plot_id: farm?.id,
+        farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha,
+        farm_gps_lat: farm?.gps_lat,
+        farm_gps_lng: farm?.gps_lng,
+      },
+    });
+    return getRequestInputMessage({ farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha });
+  }
+  if (t === '2') {
+    const farms = data.farms?.length ? data.farms : await getFarmerFarms(existing.id);
+    if (farms.length === 0) {
+      await updateSession(waFrom, { step: 'main_menu', data: {} });
+      return 'No farms to edit. Reply *MENU* for options.';
+    }
+    await updateSession(waFrom, {
+      step: 'edit_farm_select',
+      data: { farmer_id: existing.id, farms },
+    });
+    return getEditFarmSelectMessage(farms);
+  }
+  if (t === '3') {
+    return handleAddAnotherFarm(waFrom, existing);
+  }
+  return (
+    'Reply *1* to request a service, *2* to edit a farm, *3* to add a farm, or *MENU*.\n\n' +
+    (await handleRecap(waFrom, existing, false))
+  );
+}
+
+async function handleEditFarmSelect(waFrom, existing, text, data) {
+  const farms = data.farms || [];
+  const num = parseInt(text.trim(), 10);
+  if (isNaN(num) || num < 1 || num > farms.length) {
+    return `Reply with a number from 1 to ${farms.length}.\n\n` + getEditFarmSelectMessage(farms);
+  }
+  const farm = farms[num - 1];
+  await updateSession(waFrom, {
+    step: 'edit_farm_input',
+    data: {
+      farmer_id: existing.id,
+      farms,
+      edit_farm_plot_id: farm.id,
+      edit_farm_legacy: farm.id == null,
+      edit_farm_index: num - 1,
+    },
+  });
+  const size = farm.plot_size_ha ?? farm.farm_size_ha ?? '';
+  const crop = farm.crop_type || '';
+  return (
+    `Update *Farm ${num}* (current: ${size} ha — ${crop})\n\n` +
+    'Send in this format:\n\n' +
+    'Farm size (hectares):\n' +
+    'Crop(s):\n\n' +
+    '*Example:*\n' +
+    'Farm size: 3\n' +
+    'Crop: Maize'
+  );
+}
+
+async function handleEditFarmInput(waFrom, existing, text, data) {
+  const kv = parseKeyValueBlock(text);
+  const farmSize = parseFloat(kv.farm_size || kv.farm_size_hectares || '');
+  const crop = (kv.crop || kv.crops || '').trim();
+  if (isNaN(farmSize) || farmSize < 0 || !crop) {
+    return (
+      'Please send *Farm size:* and *Crop:* (both required).\n\n' +
+      '*Example:*\n' +
+      'Farm size: 3\n' +
+      'Crop: Maize'
+    );
+  }
+  try {
+    if (data.edit_farm_legacy) {
+      await pool.query('UPDATE farmers SET farm_size_ha = $1, crop_type = $2 WHERE id = $3', [
+        farmSize,
+        crop,
+        existing.id,
+      ]);
+    } else {
+      await pool.query(
+        'UPDATE farm_plots SET plot_size_ha = $1, crop_type = $2 WHERE id = $3 AND farmer_id = $4',
+        [farmSize, crop, data.edit_farm_plot_id, existing.id]
+      );
+    }
+    await updateSession(waFrom, { step: 'main_menu', data: {} });
+    return '\u2705 *Farm updated.*\n\n' + `${farmSize} ha — ${crop}\n\n` + 'Reply *MENU* for options.';
+  } catch (err) {
+    console.error('Edit farm error:', err);
+    return 'Sorry, we could not update the farm. Try again or reply *MENU*.';
+  }
+}
+
 async function handleUnsubscribeFlow(waFrom, existing) {
   await updateSession(waFrom, { step: 'unsubscribe_confirm', data: {} });
   return (
@@ -1350,7 +1510,11 @@ async function handleUnsubscribeConfirm(waFrom, existing, text) {
         await pool.query('DELETE FROM providers WHERE id = $1', [existing.id]);
       }
       await pool.query('DELETE FROM whatsapp_sessions WHERE wa_phone = $1', [normalizePhone(waFrom)]);
-      return 'Your account has been successfully removed from Digilync.\n\nThank you for using our service.';
+      return (
+        'Your account has been successfully removed from Digilync.\n\n' +
+        'Thank you for using our service.\n\n' +
+        'You can start again anytime: reply *MENU* or *hi*.'
+      );
     } catch (err) {
       console.error('Unsubscribe error:', err);
       return 'Sorry, we could not complete your request. Please try again later.';
