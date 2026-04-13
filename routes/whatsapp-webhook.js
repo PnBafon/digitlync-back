@@ -11,6 +11,33 @@ const { handleIncoming } = require('../services/whatsapp-conversation');
 const { sendBrandedText, buildBrandedBody, isEnabled } = require('../services/whatsapp-sender');
 const config = require('../config/whatsapp');
 
+/**
+ * Meta may deliver the same inbound message more than once. Skip duplicates by wamid.
+ * Best-effort in-memory (sufficient for a single Node process; rare races still possible).
+ */
+const WAMID_TTL_MS = 60 * 60 * 1000;
+const WAMID_MAX = 10000;
+const seenInboundWamids = new Map();
+
+function pruneSeenWamids(now) {
+  if (seenInboundWamids.size <= WAMID_MAX) return;
+  const cutoff = now - WAMID_TTL_MS;
+  for (const [k, t] of seenInboundWamids) {
+    if (t < cutoff) seenInboundWamids.delete(k);
+  }
+}
+
+/** @returns {boolean} true if this id was already handled recently (skip processing) */
+function isDuplicateInboundWamid(id) {
+  if (!id || typeof id !== 'string') return false;
+  const now = Date.now();
+  const prev = seenInboundWamids.get(id);
+  if (prev != null && now - prev < WAMID_TTL_MS) return true;
+  seenInboundWamids.set(id, now);
+  pruneSeenWamids(now);
+  return false;
+}
+
 /** GET - Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) */
 router.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -85,6 +112,10 @@ router.post('/webhook', async (req, res) => {
 
         if (msg.type === 'text') {
           text = msg.text?.body || '';
+          if (!String(text).trim()) {
+            console.log('[WhatsApp] Skipping empty text payload');
+            continue;
+          }
         } else if (msg.type === 'location') {
           latitude = msg.location?.latitude;
           longitude = msg.location?.longitude;
@@ -93,6 +124,10 @@ router.post('/webhook', async (req, res) => {
           const btn = msg.interactive?.button_reply;
           const list = msg.interactive?.list_reply;
           text = (btn?.title || list?.title || list?.description || '').trim();
+          if (!text) {
+            console.log('[WhatsApp] Skipping interactive message with empty body');
+            continue;
+          }
         } else {
           console.log('[WhatsApp] Unsupported message type:', msg.type);
           continue;
@@ -102,7 +137,13 @@ router.post('/webhook', async (req, res) => {
           from: '***' + String(from).slice(-4),
           bodyLen: text.length,
           type: msg.type,
+          idSuffix: msg.id ? String(msg.id).slice(-12) : null,
         });
+
+        if (msg.id && isDuplicateInboundWamid(msg.id)) {
+          console.log('[WhatsApp] Duplicate inbound message id, skipping');
+          continue;
+        }
 
         if (!isEnabled()) {
           console.warn('[WhatsApp] Meta not configured - set META_WHATSAPP_ACCESS_TOKEN, META_WHATSAPP_PHONE_NUMBER_ID in environment');

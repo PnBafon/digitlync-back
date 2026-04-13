@@ -822,37 +822,84 @@ async function applyServiceRequestGpsFromWeb(waPhone, lat, lng) {
     return { ok: false, error: 'invalid_coords' };
   }
   const phone = normalizePhone(waPhone);
-  const session = await getSession(phone);
-  const data = parseSessionData(session.data);
-  if (session.step !== 'request_await_gps_web' || !data.request_pending) {
-    return { ok: false, error: 'bad_step' };
-  }
+  const digits = phoneDigits(phone);
+
   const existing = await findExistingUser(phone);
   if (!existing || existing.type !== 'farmer') {
     return { ok: false, error: 'bad_user' };
   }
-  const rp = data.request_pending;
-  const serviceType = rp.service_type;
-  const farmSizeNum = parseFloat(rp.farm_size_ha);
-  const providers = await findMatchingProviders(serviceType, latN, lngN);
-  const digits = phoneDigits(phone);
 
-  if (providers.length === 0) {
-    try {
-      await pool.query(
+  const client = await pool.connect();
+  let session;
+  let data;
+  let serviceType;
+  let farmSizeNum;
+  let providers;
+
+  try {
+    await client.query('BEGIN');
+    const sr = await client.query(
+      `SELECT * FROM whatsapp_sessions WHERE wa_phone = $1 FOR UPDATE`,
+      [phone]
+    );
+    session = sr.rows[0];
+    if (!session) {
+      await client.query('ROLLBACK');
+      return { ok: false, error: 'bad_step' };
+    }
+    data = parseSessionData(session.data);
+    if (session.step === 'request_choose_provider') {
+      await client.query('ROLLBACK');
+      return { ok: true, already_completed: true };
+    }
+    if (session.step !== 'request_await_gps_web' || !data.request_pending) {
+      await client.query('ROLLBACK');
+      return { ok: false, error: 'bad_step' };
+    }
+
+    const rp = data.request_pending;
+    serviceType = rp.service_type;
+    farmSizeNum = parseFloat(rp.farm_size_ha);
+    providers = await findMatchingProviders(serviceType, latN, lngN);
+
+    if (providers.length === 0) {
+      await client.query(
         `INSERT INTO bookings (farmer_id, provider_id, service_type, status, farm_size_ha) VALUES ($1, NULL, $2, 'pending', $3) RETURNING id`,
         [existing.id, serviceType, farmSizeNum]
       );
-      await updateSession(phone, { step: 'main_menu', data: {} });
-      await sendBrandedText(
-        `whatsapp:${digits}`,
-        '\u2705 *Request received!* No providers matched. Admin will assign one soon. Reply *MENU* for options.'
+      await client.query(
+        `UPDATE whatsapp_sessions SET step = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE wa_phone = $1`,
+        [phone, 'main_menu', '{}']
       );
-    } catch (err) {
-      console.error('applyServiceRequestGpsFromWeb no-match booking:', err);
-      return { ok: false, error: 'db' };
+      await client.query('COMMIT');
+      try {
+        await sendBrandedText(
+          `whatsapp:${digits}`,
+          '\u2705 *Request received!* No providers matched. Admin will assign one soon. Reply *MENU* for options.'
+        );
+      } catch (err) {
+        console.error('applyServiceRequestGpsFromWeb no-match notify:', err);
+      }
+      return { ok: true, no_match: true };
     }
-    return { ok: true, no_match: true };
+
+    const newData = {
+      farmer_id: existing.id,
+      service_type: serviceType,
+      farm_size_ha: farmSizeNum,
+      matched_providers: providers,
+    };
+    await client.query(
+      `UPDATE whatsapp_sessions SET step = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE wa_phone = $1`,
+      [phone, 'request_choose_provider', JSON.stringify(newData)]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('applyServiceRequestGpsFromWeb transaction:', err);
+    return { ok: false, error: 'db' };
+  } finally {
+    client.release();
   }
 
   let msg = '*Available providers near you:*\n\n';
@@ -868,16 +915,12 @@ async function applyServiceRequestGpsFromWeb(waPhone, lat, lng) {
     msg += `Rating: ${ratingStr}\n\n`;
   });
   msg += 'Reply with number to select.';
-  await updateSession(phone, {
-    step: 'request_choose_provider',
-    data: {
-      farmer_id: existing.id,
-      service_type: serviceType,
-      farm_size_ha: farmSizeNum,
-      matched_providers: providers,
-    },
-  });
-  await sendBrandedText(`whatsapp:${digits}`, msg);
+  try {
+    await sendBrandedText(`whatsapp:${digits}`, msg);
+  } catch (err) {
+    console.error('applyServiceRequestGpsFromWeb provider list send:', err);
+    return { ok: false, error: 'send_failed' };
+  }
   return { ok: true };
 }
 
@@ -1171,6 +1214,17 @@ async function handleRequestFlow(waFrom, session, data, text, latitude, longitud
           'Reply *MENU* to cancel.'
         );
       }
+      // Avoid spamming the same reminder on every stray message while the user opens the GPS page.
+      const REMINDER_COOLDOWN_MS = 90_000;
+      const last = typeof data._gps_link_reminder_at === 'number' ? data._gps_link_reminder_at : 0;
+      const now = Date.now();
+      if (now - last < REMINDER_COOLDOWN_MS) {
+        return null;
+      }
+      await updateSession(waFrom, {
+        step: 'request_await_gps_web',
+        data: { ...data, _gps_link_reminder_at: now },
+      });
       return 'Open the GPS link we sent, then return here. Reply *1* to resend. Reply *MENU* to cancel.';
     }
 
