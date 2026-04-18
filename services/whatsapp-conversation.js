@@ -720,7 +720,11 @@ async function handleIncoming(waFrom, body, latitude, longitude, profileName) {
           farm_gps_lng: farm?.gps_lng,
         },
       });
-      return getRequestInputMessage({ farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha });
+      return getRequestInputMessage({
+        farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha,
+        farm_gps_lat: farm?.gps_lat,
+        farm_gps_lng: farm?.gps_lng,
+      });
     }
     if (existing.type === 'provider' && text === '3') {
       return 'Please register as a farmer to request services. Reply *MENU* for options.';
@@ -1116,8 +1120,22 @@ function getProviderAwaitGpsWebMessage(gpsUrl) {
   );
 }
 
+/** True when this farm plot has a real pin we can use for matching (skip redundant web GPS step). */
+function hasUsableFarmGps(lat, lng) {
+  const la = lat != null ? parseFloat(lat) : NaN;
+  const lo = lng != null ? parseFloat(lng) : NaN;
+  if (Number.isNaN(la) || Number.isNaN(lo)) return false;
+  if (la < -90 || la > 90 || lo < -180 || lo > 180) return false;
+  if (la === 0 && lo === 0) return false;
+  return true;
+}
+
 function getRequestInputMessage(data = {}) {
   const hasPresetFarm = data.farm_size_ha != null;
+  const useSavedPin = hasUsableFarmGps(data.farm_gps_lat, data.farm_gps_lng);
+  const followUp = useSavedPin
+    ? 'After you send this, we use your *saved farm pin* to match nearby providers.'
+    : 'After you send this, you will get a *link* to confirm the job location on the map.';
   let msg =
     '*Request a Service*\n\n' +
     'Select service (number):\n' +
@@ -1125,7 +1143,7 @@ function getRequestInputMessage(data = {}) {
     '*Example:*\n' +
     'Service: 1\n' +
     'Farm size: 2\n\n' +
-    'After you send this, you will get a *link* to confirm the job location on the map.\n\n' +
+    `${followUp}\n\n` +
     'Services:\n' +
     '1. Ploughing\n' +
     '2. Planting\n' +
@@ -1143,7 +1161,7 @@ function getRequestInputMessage(data = {}) {
       `Farm size on file: ${data.farm_size_ha} ha\n\n` +
       '*Example:*\n' +
       'Service: 1\n\n' +
-      'After you send this, you will get a *link* to confirm the job location on the map.\n\n' +
+      `${followUp}\n\n` +
       'Services: 1–9 as in the main menu help.';
   }
   return msg;
@@ -1153,6 +1171,8 @@ async function handleRequestFlow(waFrom, session, data, text, latitude, longitud
     await updateSession(waFrom, { step: 'main_menu', data: {} });
     return getMainMenu();
   }
+
+  const phone = normalizePhone(waFrom);
 
   switch (session.step) {
     case 'request_select_farm': {
@@ -1173,7 +1193,11 @@ async function handleRequestFlow(waFrom, session, data, text, latitude, longitud
           farm_gps_lng: farm.gps_lng,
         },
       });
-      return getRequestInputMessage({ farm_size_ha: selectedFarmSize });
+      return getRequestInputMessage({
+        farm_size_ha: selectedFarmSize,
+        farm_gps_lat: farm.gps_lat,
+        farm_gps_lng: farm.gps_lng,
+      });
     }
 
     case 'request_input': {
@@ -1183,18 +1207,43 @@ async function handleRequestFlow(waFrom, session, data, text, latitude, longitud
       const farmSize = !isNaN(farmSizeRaw) && farmSizeRaw >= 0 ? farmSizeRaw : (data.farm_size_ha != null ? parseFloat(data.farm_size_ha) : NaN);
       if (isNaN(serviceNum) || serviceNum < 1 || serviceNum > 9) return 'Please include *Service:* (1-9). Example: Service: 1';
       if (isNaN(farmSize) || farmSize < 0) return 'Please include *Farm size:* (ha). Example: Farm size: 2';
+      const requestPending = {
+        farmer_id: existing.id,
+        farm_plot_id: data.farm_plot_id ?? null,
+        service_type: SERVICE_LIST[serviceNum - 1],
+        farm_size_ha: farmSize,
+      };
+      const farmLat = data.farm_gps_lat != null ? parseFloat(data.farm_gps_lat) : NaN;
+      const farmLng = data.farm_gps_lng != null ? parseFloat(data.farm_gps_lng) : NaN;
+      if (hasUsableFarmGps(farmLat, farmLng)) {
+        await updateSession(waFrom, {
+          step: 'request_await_gps_web',
+          data: { request_pending: requestPending },
+        });
+        const r = await applyServiceRequestGpsFromWeb(phone, farmLat, farmLng);
+        if (r.ok) return null;
+        await updateSession(waFrom, {
+          step: 'request_input',
+          data: {
+            farmer_id: existing.id,
+            farm_plot_id: data.farm_plot_id ?? null,
+            farm_size_ha: data.farm_size_ha,
+            farm_gps_lat: data.farm_gps_lat,
+            farm_gps_lng: data.farm_gps_lng,
+          },
+        });
+        if (r.error === 'send_failed') {
+          return 'We could not send the provider list. Reply *MENU* and try *3* again.';
+        }
+        return 'Something went wrong while matching providers. Reply *MENU* to try again.';
+      }
       const token = crypto.randomUUID();
       const gpsUrl = `${getFrontendBaseUrl()}/gps?t=${encodeURIComponent(token)}&purpose=request`;
       await updateSession(waFrom, {
         step: 'request_await_gps_web',
         data: {
           request_gps_token: token,
-          request_pending: {
-            farmer_id: existing.id,
-            farm_plot_id: data.farm_plot_id ?? null,
-            service_type: SERVICE_LIST[serviceNum - 1],
-            farm_size_ha: farmSize,
-          },
+          request_pending: requestPending,
         },
       });
       return (
@@ -1457,7 +1506,11 @@ async function handleRecapOptionsFlow(waFrom, existing, text, data) {
         farm_gps_lng: farm?.gps_lng,
       },
     });
-    return getRequestInputMessage({ farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha });
+    return getRequestInputMessage({
+      farm_size_ha: farm?.plot_size_ha ?? farm?.farm_size_ha,
+      farm_gps_lat: farm?.gps_lat,
+      farm_gps_lng: farm?.gps_lng,
+    });
   }
   if (t === '2') {
     const farms = data.farms?.length ? data.farms : await getFarmerFarms(existing.id);
