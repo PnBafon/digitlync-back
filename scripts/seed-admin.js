@@ -2,16 +2,15 @@
  * Seed default admin user into database.
  * Run: node scripts/seed-admin.js
  *
- * Default credentials:
- *   username: admin1234
- *   password: admin4321
+ * Seeds the default admin user (run after deploy or credential rotation).
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
-const ADMIN_USERNAME = 'admin1234';
-const ADMIN_PASSWORD = 'admin4321';
+const ADMIN_USERNAME = 'Reset@Digilync';
+const ADMIN_PASSWORD = 'Reset@Password!';
+const LEGACY_USERNAME = 'admin1234';
 
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password).digest('hex');
@@ -36,6 +35,8 @@ async function seed() {
       )
     `);
 
+    await pool.query('DELETE FROM admins WHERE username = $1', [LEGACY_USERNAME]);
+
     const hash = hashPassword(ADMIN_PASSWORD);
     await pool.query(
       `INSERT INTO admins (username, password_hash)
@@ -44,9 +45,7 @@ async function seed() {
       [ADMIN_USERNAME, hash]
     );
 
-    console.log('Default admin seeded successfully.');
-    console.log('  Username:', ADMIN_USERNAME);
-    console.log('  Password:', ADMIN_PASSWORD);
+    console.log('Admin user seeded successfully.');
   } catch (err) {
     console.error('Seed failed:', err.message);
     process.exit(1);
